@@ -178,12 +178,11 @@ jobs:
           # the file on disk never reaches the running process. We need a real
           # writable pipe, which only System.Diagnostics.Process exposes.
           #
-          # -t 600 is a belt-and-suspenders cap so the container still
-          # finalizes even if the 'q' is somehow missed; -pix_fmt yuv420p keeps
+          # -pix_fmt yuv420p keeps
           # the output broadly playable.
           $psi = New-Object System.Diagnostics.ProcessStartInfo
           $psi.FileName = "ffmpeg"
-          $psi.Arguments = "-y -f gdigrab -framerate 15 -i desktop -t 600 " +
+          $psi.Arguments = "-y -f gdigrab -framerate 15 -i desktop " +
                            "-hide_banner -loglevel error " +
                            "-c:v libx264 -preset ultrafast -pix_fmt yuv420p recording.mkv"
           $psi.RedirectStandardInput = $true
