@@ -72,7 +72,10 @@ ClickCenterOfImageInWindow(winTitle, imageFile, timeoutMs := 10000, intervalMs :
 
     startTime := A_TickCount
 
-    timeLeft := timeoutMs - (A_TickCount - startTime)
+    timeLeft := 1
+
+    ToolTip(Format("Searching for button file {} in window {}...  {}s left", imageFile, winTitle, Round(timeLeft / 1000, 2)))
+
     while (timeLeft > 0)
     {
         if ImageSearch(&x, &y, wx, wy, wx + ww, wy + wh, Format("*10 {}", imageFile))
