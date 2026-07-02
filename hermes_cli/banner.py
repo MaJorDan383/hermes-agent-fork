@@ -873,17 +873,22 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
     except Exception:
         pass  # Never break the banner over an update check
 
-    # Pip-install warning — `pip install hermes-agent` is not the supported
-    # install path (it exists on PyPI for internal/CI reasons, not end users).
-    # Such installs miss the git checkout + installer-managed deps, so updates,
-    # self-update, and issue triage don't behave correctly. Warn, don't block.
+    # Unsupported install-method warning — pip/PyPI and Homebrew are no
+    # longer an officially supported distribution method (see
+    # website/docs/getting-started/platform-support.md). Such installs miss
+    # the git checkout + installer-managed deps, so updates, self-update, and
+    # issue triage don't behave correctly. Warn, don't block. NixOS is fully
+    # supported and never hits this.
     try:
-        from hermes_cli.config import detect_install_method
-        if detect_install_method() == "pip":
+        from hermes_cli.config import (
+            detect_install_method,
+            format_unsupported_install_warning,
+            is_unsupported_install_method,
+        )
+        _install_method = detect_install_method()
+        if is_unsupported_install_method(_install_method):
             right_lines.append(
-                "[bold yellow]⚠ pip install not officially supported[/]"
-                "[dim yellow] — exists for reasons other than user install; "
-                "expect instability and an inability to support issues[/]"
+                f"[bold yellow]⚠ {format_unsupported_install_warning(_install_method)}[/]"
             )
     except Exception:
         pass  # Never break the banner over the install-method check
