@@ -229,9 +229,9 @@ def _read_openai_version_fast() -> str | None:
 def _print_fast_version_info() -> None:
     from hermes_cli import __release_date__, __version__
 
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
     print(f"Hermes Agent v{__version__} ({__release_date__})")
-    print(f"Project: {project_root}")
+    print(f"Install directory: {PROJECT_ROOT}")
+
     print(f"Python: {sys.version.split()[0]}")
 
     openai_version = _read_openai_version_fast()
@@ -4337,10 +4337,12 @@ def cmd_import(args):
 
 
 def _print_version_info(*, check_updates: bool = True) -> None:
+    from hermes_cli.config import detect_install_method
     from hermes_cli.banner import format_banner_version_label
 
     print(format_banner_version_label())
-    print(f"Project: {PROJECT_ROOT}")
+    print(f"Install directory: {PROJECT_ROOT}")
+    print(f"Install method: {detect_install_method(PROJECT_ROOT)}")
 
     # Show Python version
     print(f"Python: {sys.version.split()[0]}")
