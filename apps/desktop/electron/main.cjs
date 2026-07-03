@@ -3861,6 +3861,20 @@ function getWindowButtonPosition() {
   return mainWindow?.getWindowButtonPosition?.() || WINDOW_BUTTON_POSITION
 }
 
+// macOS product major (26 = Tahoe), or null off macOS. Static per boot, so cache
+// it. The renderer uses this to widen the left titlebar cluster's offset past
+// Tahoe's larger traffic lights.
+let macOSMajorCache
+function getMacOSMajor() {
+  if (macOSMajorCache !== undefined) return macOSMajorCache
+  macOSMajorCache = null
+  if (IS_MAC) {
+    const major = Number.parseInt(process.getSystemVersion?.() ?? '', 10)
+    if (Number.isFinite(major)) macOSMajorCache = major
+  }
+  return macOSMajorCache
+}
+
 function getNativeOverlayWidth() {
   return computeNativeOverlayWidth({ isWindows: IS_WINDOWS, isWsl: IS_WSL, isMac: IS_MAC })
 }
@@ -3868,6 +3882,7 @@ function getNativeOverlayWidth() {
 function getWindowState() {
   return {
     isFullscreen: Boolean(mainWindow?.isFullScreen?.()),
+    macOSMajor: getMacOSMajor(),
     nativeOverlayWidth: getNativeOverlayWidth(),
     windowButtonPosition: getWindowButtonPosition()
   }

@@ -4,6 +4,12 @@ export const TITLEBAR_HEIGHT = 34
 export const MACOS_TRAFFIC_LIGHTS_HEIGHT = 14
 export const TITLEBAR_ICON_SIZE = 12
 export const TITLEBAR_CONTROL_OFFSET_X = 74
+// macOS Tahoe (26+) enlarged the traffic lights, so the pre-Tahoe cluster width
+// no longer clears them and our left tools overlap. Electron only reports the
+// cluster's origin (not its width), so we can't measure the delta — gate a wider
+// offset on the OS major instead. Pre-Tahoe stays byte-identical.
+export const TITLEBAR_CONTROL_OFFSET_X_TAHOE = 88
+export const MACOS_TAHOE_MAJOR = 26
 export const TITLEBAR_CONTROL_HEIGHT = 22
 export const TITLEBAR_CONTROLS_TOP = (TITLEBAR_HEIGHT - TITLEBAR_CONTROL_HEIGHT) / 2
 export const TITLEBAR_FALLBACK_WINDOW_BUTTON_X = 24
@@ -29,7 +35,8 @@ export const titlebarHeaderShadowClass =
 
 export function titlebarControlsPosition(
   windowButtonPosition: HermesConnection['windowButtonPosition'] | undefined,
-  isFullscreen = false
+  isFullscreen = false,
+  macOSMajor: number | null = null
 ) {
   const top = Math.max(0, TITLEBAR_CONTROLS_TOP)
 
@@ -41,8 +48,13 @@ export function titlebarControlsPosition(
     return { left: TITLEBAR_EDGE_INSET, top }
   }
 
+  const offset =
+    macOSMajor !== null && macOSMajor >= MACOS_TAHOE_MAJOR
+      ? TITLEBAR_CONTROL_OFFSET_X_TAHOE
+      : TITLEBAR_CONTROL_OFFSET_X
+
   return {
-    left: (windowButtonPosition?.x ?? TITLEBAR_FALLBACK_WINDOW_BUTTON_X) + TITLEBAR_CONTROL_OFFSET_X,
+    left: (windowButtonPosition?.x ?? TITLEBAR_FALLBACK_WINDOW_BUTTON_X) + offset,
     top
   }
 }

@@ -86,7 +86,11 @@ export function AppShell({
   // pop-out) is a compact side panel — none of them carry the full titlebar
   // tool cluster. Gate on isSecondaryWindow, never the narrower new-session flag.
   const hideTitlebarControls = isSecondaryWindow()
-  const titlebarControls = titlebarControlsPosition(connection?.windowButtonPosition, isFullscreen)
+  const titlebarControls = titlebarControlsPosition(
+    connection?.windowButtonPosition,
+    isFullscreen,
+    connection?.macOSMajor ?? null
+  )
   // Width Windows/WSLg reserve for the native min/max/close overlay (zero on
   // macOS, where window controls sit on the left and are reported via
   // windowButtonPosition instead). The right tool cluster has to clear them.

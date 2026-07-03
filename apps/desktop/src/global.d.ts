@@ -356,6 +356,9 @@ export interface HermesConnection {
   isFullscreen: boolean
   mode?: 'local' | 'remote'
   authMode?: 'oauth' | 'token'
+  // macOS product major (26 = Tahoe); null off macOS. Widens the left titlebar
+  // cluster offset past Tahoe's larger traffic lights.
+  macOSMajor?: number | null
   nativeOverlayWidth: number
   source?: 'env' | 'local' | 'settings'
   token: string
@@ -374,6 +377,7 @@ export interface HermesTitleBarTheme {
 
 export interface HermesWindowState {
   isFullscreen: boolean
+  macOSMajor?: number | null
   nativeOverlayWidth: number
   windowButtonPosition: { x: number; y: number } | null
 }
