@@ -103,25 +103,18 @@ wsl journalctl --user -u llama-watchdog.service -n 20 --no-pager
 
 ## Future / Ideal Implementation
 
-This watchdog exists because Hermes has no `on_provider_switch` plugin hook. Every feature here — the strict exclusivity arbiter, the app-close cleanup, the fast auto-start on model selection, and the after-start mmproj prompt — is a workaround for capabilities that should live in the Hermes core.
+This watchdog exists because Hermes has no `on_provider_switch` plugin hook. **Every feature here is a workaround** for a capability that should live in the Hermes core:
 
-**The ideal solution is a Hermes core-side `on_provider_switch` hook** that fires BEFORE the engine loads. This would enable:
+| Problem | Workaround (current watchdog) | Ideal (single core hook) |
+|---|---|---|
+| **Multiple engines loaded at once** → OOM | External ARBITER polls and stops competing engines | Core enforces one-engine-at-a-time exclusivity natively |
+| **Engine stays in VRAM after app close** | WSL polls `tasklist.exe` for `Hermes.exe` every 5s | Core terminates engines on Hermes exit automatically |
+| **Slow start on model selection** | Tails `agent.log` every 5s for provider-switch events | Core fires `on_provider_switch` synchronously — no polling delay |
+| **mmproj can't be configured before load** | Starts without mmproj, agent asks after, restarts (~36s cold load) | Agent asks BEFORE engine loads — first start is correct |
 
-- **Strict exclusivity by default** — core enforces one engine at a time, no need for an external arbiter
-- **Clean shutdown on app close** — core terminates engines when Hermes exits, no tasklist.exe polling needed
-- **Faster load on selection** — core can prepare the engine in parallel with the model download/load, no 5s log-tail delay
-- **Pre-load agent prompt** — agent asks about mmproj (and any other config) BEFORE the engine starts, eliminating the cold restart
+**On 24 GB consumer GPUs (RTX 4090), every megabyte counts.** A single orphaned engine leaking VRAM, a second model loading while one is already resident, or an unnecessary mmproj file consuming ~2 GB can mean the difference between a working session and a hard OOM freeze. Hermes has the architecture to handle this intelligently — the agent is already in the loop, the skill system can prompt at the right time, and the gateway can manage lifecycle. It just needs the plugin hook to tie it all together.
 
-Without this hook, every local-engine workflow requires this kind of external watchdog — agent.log tailing, state.db polling, tasklist.exe process checks, and after-start restarts. It works, but it's inherently reactive and slower than a core integration would be.
-
-**No platform handles local inference engines properly on consumer hardware.** LM Studio, Ollama, text-generation-webui — none of them:
-
-1. **Enforce one-engine-at-a-time exclusivity.** You can accidentally load two models, OOM your GPU, and hard-freeze your system.
-2. **Clean up engines on app close.** Switch to a different app? The engine stays in VRAM, consuming power and blocking other GPU workloads.
-3. **Auto-start on model selection.** You manually start/stop engines or rely on lazy-loading that causes multi-minute delays mid-conversation.
-4. **Ask about optional components (mmproj) at load time.** They either always load mmproj (wasting ~2GB VRAM you might need for context) or require manual config file edits.
-
-**On 24 GB consumer GPUs (RTX 4090), every megabyte counts.** A single orphaned engine, a second model loading while one is already loaded, or an unnecessary mmproj can mean the difference between a working session and a hard OOM freeze. Hermes has the architecture to handle this intelligently — the agent is already in the loop, the skill system can prompt at the right time, and the gateway can manage lifecycle. It just needs the plugin hook to tie it all together.
+**No platform handles local inference engines properly on consumer hardware.** LM Studio, Ollama, text-generation-webui — none of them enforce exclusivity, clean up on close, auto-start on selection, or ask about optional VRAM-heavy components at load time. They either always-load (wasting VRAM), never-cleanup (leaking VRAM), or require manual config edits (poor UX).
 
 **A single `on_provider_switch` hook in the Hermes core would put this platform lightyears ahead** of every other local inference frontend for consumer hardware.
 
