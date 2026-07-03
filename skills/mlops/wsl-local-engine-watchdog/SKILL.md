@@ -1,28 +1,29 @@
 ---
 name: wsl-local-engine-watchdog
-description: WSL2 local engine watchdog — auto-start/stop llama.cpp, vLLM, or any local inference engine on Hermes provider switch
-version: 4.0.0
+description: "WSL2 local engine watchdog — STRICT EXCLUSIVITY arbiter: only one local LLM engine runs at a time (llama.cpp, vLLM, etc.) with mmproj (vision) toggle support"
+version: 6.0.0
 author: Hermes Agent
-tags: [wsl, llama.cpp, vllm, watchdog, vram, provider-switch, local-engine, systemd]
+tags: [wsl, llama.cpp, vllm, watchdog, vram, provider-switch, local-engine, systemd, arbiter, exclusivity, mmproj, vision, multimodal]
 metadata:
   hermes:
     related_skills: [llama-cpp-wsl-ops]
 ---
 
-# WSL Local Engine Watchdog
+# WSL Local Engine Watchdog (Strict Exclusivity + mmproj Toggle)
 
-A Python watchdog for WSL2 that **auto-starts and auto-stops local inference engines** (llama.cpp, vLLM, or any engine via systemd) based on which Hermes provider you select. **The agent.log provider-switch event is THE ONLY trigger** for lifecycle.
+A Python watchdog for WSL2 that **auto-starts and auto-stops local inference engines** based on which Hermes provider you select. **Enforces strict exclusivity — only one engine service is ever active at a time** to guarantee VRAM safety.
 
-Works with **ANY local engine** — register it in `local_engines.json` or let auto-detection infer the engine from the provider name.
+**mmproj (vision) toggle:** When a local model supports multimodal, the watchdog checks a flag file at `/tmp/<provider>_mmproj` to decide whether to load the vision mmproj. If present, it uses the multimodal service variant. If absent, it uses the standard (VRAM-efficient) service.
 
 ## Behavior
 
-- **Auto-starts** a local engine within 5s when you select a registered provider
-- **Auto-stops immediately** when you switch away to a non-local provider
-- **Auto-stops on app close** — detects Hermes.exe process exit via `tasklist.exe` and unloads within 5s
-- **Engine-to-engine switch** — if you switch from one local engine provider to another, stops the old, starts the new
-- **Multi-session safe** — checks all active sessions in `state.db` before stopping (another gateway session may still need the engine)
-- **Idle timeout (15 min)** — safety-net fallback only
+- **Strict exclusivity** — Only one engine service is ever active at a time
+- **mmproj toggle** — `/tmp/<provider>_mmproj` flag file controls whether vision mmproj is loaded on next start
+- **Auto-starts/stops** on provider switch (agent.log tail)
+- **Auto-stops on app close** (Hermes.exe tasklist check)
+- **Multi-session safe** — checks state.db, won't stop if another session needs it
+- **Idle timeout (15 min)** — safety-net fallback
+- **Does NOT manage TTS/STT** — those are independent
 
 ## Architecture
 
@@ -30,80 +31,26 @@ Works with **ANY local engine** — register it in `local_engines.json` or let a
 Session: /model provider switch
         │
         ▼
-  Hermes agent.log ──► "Model switched in-place: A (X) -> B (llama-qwen)"
-                  OR  "Model switched in-place: ... (llama-qwen) -> ... (other)"
+  Hermes agent.log ──► "Model switched in-place: ... (X) -> ... (llama-qwen)"
                              │
                         every 5s tail
+                             │
                              ▼
-  local-engine-watchdog (systemd user service on WSL)
-     ├─ agent.log tail — THE trigger (start ON switch-to, stop ON switch-away)
-     ├─ local_engines.json — registered engine configs
-     ├─ auto-detect — name-based fallback ("llama" → llama.cpp, "vllm" → vLLM)
-     ├─ tasklist.exe — check Hermes.exe process (app-close → stop all)
-     ├─ state.db poll — multi-session guard only (other gateway sessions)
-     └─ log mtime check — idle timeout safety net per engine
+  local-engine-watchdog (systemd on WSL) — ARBITER + MMPROJ AWARE
+     ├─ agent.log tail — THE trigger
+     ├─ local_engines.json — engine configs (service, service_mmproj, mmproj, log)
+     ├─ /tmp/<provider>_mmproj flag — if exists → use service_mmproj variant
+     ├─ ARBITER — stop every other running engine before starting
+     ├─ tasklist.exe — app close → stop all
+     ├─ state.db — multi-session guard
+     └─ log mtime — idle timeout
              │
       start / stop
              ▼
-  Per-engine systemd service (llama-server.service / vllm.service / etc.)
+  llama-server.service  (no mmproj, -1~2GB VRAM)
+  ─ OR ─  (mutually exclusive)
+  llama-server-multimodal.service  (with mmproj vision, +1~2GB VRAM)
 ```
-
-## Quick Start
-
-```bash
-# 1. Configure your engine(s) in ~/scripts/local_engines.json
-cat > ~/scripts/local_engines.json << 'EOF'
-{
-  "llama-qwen": {
-    "engine": "llama.cpp",
-    "service": "llama-server.service",
-    "log": "/home/vibrationall/ai/llama.cpp/server.log"
-  }
-}
-EOF
-
-# 2. Deploy the watchdog script
-cp local_engine_watchdog.py ~/scripts/local_engine_watchdog.py
-
-# 3. Install the systemd service (see below)
-# 4. Restart
-systemctl --user restart llama-watchdog.service
-```
-
-## Key Findings (don't repeat debugging)
-
-### state.db does NOT update on `/model` mid-session
-TUI sessions change provider at runtime. The `model` and `model_config` columns in `state.db` remain at the original value until the session ends. **Do not rely on state.db for TUI provider detection.**
-
-### agent.log IS the real-time signal
-Hermes writes a log line on every model switch:
-```
-Model switched in-place: deepseek-v4-flash-free (opencode) -> qwen3.6-heretic (llama-qwen)
-```
-This is the fast path for auto-start. The watchdog tails this file from `/mnt/c/.../hermes/logs/agent.log`.
-
-### SQLite over /mnt/c/ 9p has locking issues
-WSL's 9p filesystem does not support SQLite file locking. Direct queries fail with `disk I/O error`. Always copy the DB to `/tmp` before querying:
-```python
-tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-shutil.copy2(DB_SRC, tmp.name)
-conn = sqlite3.connect(tmp.name)
-# ... query ...
-os.unlink(tmp.name)
-```
-
-### Multi-session safety
-The watchdog checks ALL active sessions (gateway + TUI) via state.db for any registered engine:
-- **Switch-away stop**: only stops a specific engine if NO other session still uses it
-- **Stop from other session end**: when a gateway session using an engine ends and the local session is on a different provider, the next state.db poll sees no active engine sessions → stops
-
-### Engine auto-detection (convention-based)
-Providers without a config entry are auto-detected by name:
-| Name pattern | Engine | Default service |
-|---|---|---|
-| Contains `"llama"` | llama.cpp | `llama-server.service` |
-| Contains `"vllm"` | vLLM | `vllm.service` |
-| Contains `"local"` or `"wsl"` | local | `llama-server.service` |
 
 ## Components
 
@@ -114,31 +61,97 @@ Providers without a config entry are auto-detected by name:
   "llama-qwen": {
     "engine": "llama.cpp",
     "service": "llama-server.service",
+    "service_mmproj": "llama-server-multimodal.service",
+    "mmproj": "/home/vibrationall/ai/llama.cpp/models/gemma-4/mmproj-Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-BF16.gguf",
     "log": "/home/vibrationall/ai/llama.cpp/server.log"
-  },
-  "vllm": {
-    "engine": "vllm",
-    "service": "vllm.service",
-    "log": "/home/vibrationall/ai/vllm/server.log"
   }
 }
 ```
 
 | Field | Required | Description |
 |---|---|---|
-| `engine` | Yes | Human-readable engine name (for logging) |
-| `service` | Yes | systemd service unit name (without `.service` suffix) |
-| `log` | No | Path to server log file (used for idle timeout) |
+| `engine` | Yes | Human-readable name |
+| `service` | Yes | Standard systemd service (no mmproj) |
+| `service_mmproj` | No | Multimodal systemd service (with --mmproj flag) |
+| `mmproj` | No | Path to mmproj GGUF file (for documentation) |
+| `log` | No | Server log path for idle timeout |
 
-Each key is a Hermes provider name. When Hermes switches to that provider, the watchdog manages the corresponding service.
+### 2. Script: `~/scripts/local_engine_watchdog.py`
 
-### 2. Per-engine systemd service (example: llama.cpp)
+Full script deployed on WSL. Core logic:
 
-File: `~/.config/systemd/user/llama-server.service`
+```python
+def get_service_to_start(provider_name, cfg):
+    """Pick mmproj-enabled service if flag exists and config supports it."""
+    flag = f"/tmp/{provider_name}_mmproj"
+    if cfg.get("service_mmproj") and os.path.exists(flag):
+        return cfg["service_mmproj"]
+    return cfg.get("service", "")
 
+# ARBITER main loop
+while True:
+    time.sleep(5)
+    event = parse_agent_log()
+    action, old_p, new_p = event["action"], event["old"], event["new"]
+
+    if action in ("start","switch"):
+        _, new_cfg = get_engine(new_p)
+        if new_cfg:
+            target_svc = get_service_to_start(new_p, new_cfg)
+            # Stop every OTHER engine service (both variants)
+            for prov, cfg in engines.items():
+                if prov != new_p:
+                    for key in ("service","service_mmproj"):
+                        svc = cfg.get(key)
+                        if svc and service_running(svc):
+                            stop_service(svc)
+            # Kill target if alive, then start fresh
+            if service_running(target_svc): stop_service(target_svc)
+            time.sleep(1)
+            start_service(target_svc)
+            current_provider = new_p
+        continue
+
+    if action == "stop":
+        _, old_cfg = get_engine(old_p)
+        if old_cfg and not sessions_still_need_engine(old_p):
+            # Stop BOTH service variants (safety sweep)
+            for key in ("service","service_mmproj"):
+                svc = old_cfg.get(key)
+                if svc and service_running(svc): stop_service(svc)
+            if old_p == current_provider: current_provider = None
+        continue
+
+    # App close → stop all
+    if not hermes_app_running() and not any_session_uses_local_engine():
+        stop_all_engines()
+        current_provider = None
+        continue
+
+    # Idle timeout per engine
+    for prov, cfg in engines.items():
+        if engine_idle(cfg):
+            for key in ("service","service_mmproj"):
+                svc = cfg.get(key)
+                if svc and service_running(svc):
+                    if not sessions_still_need_engine(prov):
+                        stop_service(svc)
+```
+
+Key functions:
+- `get_engine(provider)` — resolves provider name to engine config (explicit config or auto-detect)
+- `get_service_to_start(provider, cfg)` — checks `/tmp/<provider>_mmproj` flag to pick service variant
+- `parse_agent_log()` — tails agent.log for `Model switched in-place` events
+- `hermes_app_running()` — checks Windows tasklist for Hermes.exe
+- `sessions_still_need_engine(provider)` — multi-session safety via state.db
+- `service_running(svc)` / `start_service(svc)` / `stop_service(svc)` — systemd wrappers
+
+### 3. Systemd services
+
+**Standard** (`~/.config/systemd/user/llama-server.service`):
 ```ini
 [Unit]
-Description=llama.cpp Qwen3.6 Server
+Description=llama.cpp Inference Server (no mmproj)
 After=network.target
 
 [Service]
@@ -147,7 +160,13 @@ Environment=HOME=/home/vibrationall
 Environment=USER=vibrationall
 Environment=PATH=/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=LD_LIBRARY_PATH=/home/vibrationall/ai/turboquant_llama/build/bin:/usr/local/cuda/lib64:/usr/lib/wsl/lib
-ExecStart=/home/vibrationall/ai/turboquant_llama/build/bin/llama-server -m /home/vibrationall/ai/llama.cpp/models/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-Q4_K_M.gguf --host 0.0.0.0 --port 8080 -c 131072 -ctk q8_0 -ctv turbo4 -ngl 99 --cont-batching -np 8 --cache-prompt --flash-attn auto
+ExecStart=/home/vibrationall/ai/turboquant_llama/build/bin/llama-server \
+  -m /home/vibrationall/ai/llama.cpp/models/gemma-4/Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-Q4_K_M.gguf \
+  --model-draft /home/vibrationall/ai/llama.cpp/models/gemma-4/mtp-gemma-4-26B-A4B-it.gguf \
+  --spec-type draft-mtp --spec-draft-n-max 5 \
+  --host 0.0.0.0 --port 8080 \
+  -c 140000 -ctk turbo4 -ctv turbo4 -ngl 99 \
+  --cont-batching -np 1 --cache-prompt --flash-attn auto
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=300
@@ -159,251 +178,34 @@ StandardError=append:/home/vibrationall/ai/llama.cpp/server.log
 WantedBy=default.target
 ```
 
-Each engine you add needs its own systemd service unit.
-
-### 3. Session-aware watchdog
-
-#### Script: `~/scripts/local_engine_watchdog.py`
-
-```python
-#!/usr/bin/env python3
-"""Local engine session-aware watchdog for WSL2.
-
-THE ONLY trigger for loading/unloading a local inference engine (llama.cpp,
-vLLM, etc.) is the provider-switch event in Hermes agent.log.
-
-When the user selects ANY registered local engine provider, start its systemd
-service. When they switch away to a non-local provider, stop it immediately.
-Also stops all engines when the Hermes desktop app closes.
-
-Engines are configured in ~/scripts/local_engines.json:
-{
-  "llama-qwen": {
-    "engine": "llama.cpp",
-    "service": "llama-server.service",
-    "log": "/home/vibrationall/ai/llama.cpp/server.log"
-  },
-  "vllm": {
-    "engine": "vllm",
-    "service": "vllm.service",
-    "log": "/home/vibrationall/ai/vllm/server.log"
-  }
-}
-"""
-
-import sqlite3, json, os, shutil, time, subprocess, tempfile, re
-
-ENGINE_CONFIG = os.path.expanduser("~/scripts/local_engines.json")
-AGENT_LOG = "/mnt/c/Users/MaJor/AppData/Local/hermes/logs/agent.log"
-DB_SRC = "/mnt/c/Users/MaJor/AppData/Local/hermes/state.db"
-IDLE_CAP = 15 * 60
-
-_last_pos = 0
-
-def load_engines():
-    """Load the engine config registry. Returns {provider_name: config_dict}."""
-    if not os.path.exists(ENGINE_CONFIG):
-        return {}
-    try:
-        with open(ENGINE_CONFIG) as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-def get_engine(provider_name):
-    """Get engine config for a provider.
-
-    Tries explicit config first, then name-based heuristics:
-      - contains "llama" -> llama.cpp w/ llama-server.service
-      - contains "vllm"  -> vLLM w/ vllm.service
-      - contains "local"/"wsl" -> local w/ llama-server.service
-    """
-    engines = load_engines()
-    cfg = engines.get(provider_name)
-    if cfg: return cfg
-    p = provider_name.lower()
-    if "llama" in p:
-        return {"engine":"llama.cpp","service":"llama-server.service","log":""}
-    if "vllm" in p:
-        return {"engine":"vllm","service":"vllm.service","log":""}
-    if "local" in p or "wsl" in p:
-        return {"engine":"local","service":"llama-server.service","log":""}
-    return None
-
-def is_known_engine(provider_name):
-    return get_engine(provider_name) is not None
-
-def parse_agent_log():
-    """Scan new lines in agent.log for model-switch events.
-
-    Returns dict: {action: "start"|"stop"|"switch"|None,
-                   provider: ..., new_provider: ...}
-    """
-    global _last_pos
-    if not os.path.exists(AGENT_LOG):
-        return {"action":None,"provider":None,"new_provider":None}
-    size = os.path.getsize(AGENT_LOG)
-    if size < _last_pos: _last_pos = 0
-    if size == _last_pos:
-        return {"action":None,"provider":None,"new_provider":None}
-    result = {"action":None,"provider":None,"new_provider":None}
-    try:
-        with open(AGENT_LOG,"r",errors="replace") as f:
-            f.seek(_last_pos)
-            for line in f:
-                m = re.search(
-                    r"Model switched in-place: (.+) \(([^)]+)\) -> (.+) \(([^)]+)\)",line
-                )
-                if m:
-                    old_p, new_p = m.group(2), m.group(4)
-                    old_e, new_e = is_known_engine(old_p), is_known_engine(new_p)
-                    if new_e:
-                        result = {"action":"start","provider":new_p,"new_provider":new_p}
-                    elif old_e and not new_e:
-                        result = {"action":"stop","provider":old_p,"new_provider":new_p}
-                    elif old_e and new_e and old_p != new_p:
-                        result = {"action":"switch","provider":old_p,"new_provider":new_p}
-            _last_pos = f.tell()
-    except Exception:
-        pass
-    return result
-
-def hermes_app_running():
-    """Check if the Hermes desktop app process is running on Windows."""
-    try:
-        r = subprocess.run(
-            ["/mnt/c/Windows/System32/tasklist.exe",
-             "/FI","IMAGENAME eq Hermes.exe","/NH"],
-            capture_output=True,text=True,timeout=5
-        )
-        return "Hermes" in r.stdout
-    except Exception:
-        return True
-
-def sessions_still_need_engine(provider_name):
-    """Multi-session guard: any active session still uses this engine?"""
-    if not os.path.exists(DB_SRC): return False
-    tmp = tempfile.NamedTemporaryFile(suffix=".db",delete=False)
-    tmp_path = tmp.name; tmp.close()
-    try:
-        shutil.copy2(DB_SRC,tmp_path)
-        conn = sqlite3.connect(tmp_path)
-        conn.execute("PRAGMA busy_timeout=200")
-        rows = conn.execute(
-            "SELECT model_config FROM sessions WHERE ended_at IS NULL"
-        ).fetchall()
-        conn.close()
-    except Exception: return False
-    finally:
-        try: os.unlink(tmp_path)
-        except: pass
-    for (cfg_json,) in rows:
-        try:
-            cfg = json.loads(cfg_json)
-            if cfg.get("provider") == provider_name: return True
-            gr = cfg.get("gateway_runtime") or {}
-            if gr.get("provider") == provider_name: return True
-        except Exception: continue
-    return False
-
-def engine_running(cfg):
-    try:
-        r = subprocess.run(["systemctl","--user","is-active",cfg["service"]],
-                           capture_output=True,text=True,timeout=5)
-        return r.returncode == 0
-    except: return False
-
-def start_engine(cfg, provider):
-    print(f"Starting {provider} ({cfg['engine']}) via {cfg['service']}...",flush=True)
-    subprocess.run(["systemctl","--user","start",cfg["service"]],
-                   capture_output=True,timeout=300)
-
-def stop_engine(cfg, provider):
-    print(f"Stopping {provider} ({cfg['engine']}) via {cfg['service']}...",flush=True)
-    subprocess.run(["systemctl","--user","stop",cfg["service"]],
-                   capture_output=True,timeout=15)
-
-def engine_idle_too_long(cfg):
-    log = cfg.get("log","")
-    if not log or not os.path.exists(log): return True
-    return (time.time() - os.path.getmtime(log)) > IDLE_CAP
-
-def stop_all_engines():
-    for prov, cfg in load_engines().items():
-        if engine_running(cfg):
-            print(f"App closed: stopping {prov}...",flush=True)
-            stop_engine(cfg, prov)
-
-if __name__ == "__main__":
-    print("local-engine watchdog starting",flush=True)
-    if os.path.exists(AGENT_LOG):
-        _last_pos = max(0, os.path.getsize(AGENT_LOG) - 4096)
-    current_provider = None
-    while True:
-        time.sleep(5)
-        engines = load_engines()
-        event = parse_agent_log()
-        action, provider, new_provider = event["action"], event["provider"], event["new_provider"]
-
-        if action == "switch":
-            old_cfg = get_engine(provider)
-            new_cfg = get_engine(new_provider)
-            if old_cfg and engine_running(old_cfg) and not sessions_still_need_engine(provider):
-                stop_engine(old_cfg, provider)
-            if new_cfg:
-                start_engine(new_cfg, new_provider)
-                current_provider = new_provider
-            continue
-
-        if action == "start":
-            cfg = get_engine(provider)
-            if cfg and not engine_running(cfg):
-                start_engine(cfg, provider)
-                current_provider = provider
-            continue
-
-        if action == "stop":
-            cfg = get_engine(provider)
-            if cfg and engine_running(cfg) and not sessions_still_need_engine(provider):
-                stop_engine(cfg, provider)
-                if provider == current_provider: current_provider = None
-            continue
-
-        if not hermes_app_running():
-            # Check if any engine is still needed by other sessions
-            any_active = False
-            for prov in list(load_engines().keys()):
-                if sessions_still_need_engine(prov):
-                    any_active = True
-                    break
-            if not any_active:
-                stop_all_engines()
-                current_provider = None
-            continue
-
-        # State.db fallback: orphaned sessions need an engine
-        if not any([engine_running(c) for c in load_engines().values()]):
-            for prov, cfg in load_engines().items():
-                if sessions_still_need_engine(prov):
-                    start_engine(cfg, prov)
-                    current_provider = prov
-                    break
-            continue
-
-        # Idle timeout safety net per engine
-        for prov, cfg in load_engines().items():
-            if engine_running(cfg) and engine_idle_too_long(cfg):
-                if not sessions_still_need_engine(prov):
-                    print(f"Idle timeout: stopping {prov}...",flush=True)
-                    stop_engine(cfg, prov)
-                    if prov == current_provider: current_provider = None
+**Multimodal** (`~/.config/systemd/user/llama-server-multimodal.service`):
+Same as standard but adds:
+```
+  --mmproj /home/vibrationall/ai/llama.cpp/models/gemma-4/mmproj-Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-BF16.gguf \
+  --no-mmproj-offload \
 ```
 
-#### Watchdog systemd service: `~/.config/systemd/user/llama-watchdog.service`
+### 4. mmproj toggle script: `~/scripts/toggle_mmproj.sh`
+
+```bash
+#!/usr/bin/env bash
+PROVIDER="${1:?Usage: toggle_mmproj.sh <provider> [on|off|status]}"
+ACTION="${2:-toggle}"
+FLAG_FILE="/tmp/${PROVIDER}_mmproj"
+case "$ACTION" in
+  on)    touch "$FLAG_FILE"; echo "mmproj ENABLED for $PROVIDER" ;;
+  off)   rm -f "$FLAG_FILE";  echo "mmproj DISABLED for $PROVIDER" ;;
+  status) [ -f "$FLAG_FILE" ] && echo "ENABLED" || echo "DISABLED" ;;
+  toggle) [ -f "$FLAG_FILE" ] && rm -f "$FLAG_FILE" || touch "$FLAG_FILE" ;;
+esac
+```
+
+### 5. Watchdog systemd service: `~/.config/systemd/user/llama-watchdog.service`
 
 ```ini
 [Unit]
-Description=Local engine watchdog (auto-starts/stops llama.cpp/vLLM etc. on provider switch)
+Description=Local engine watchdog (STRICT EXCLUSIVITY arbiter for llama.cpp/vLLM/etc)
+After=network.target
 
 [Service]
 Type=simple
@@ -415,73 +217,37 @@ RestartSec=10
 WantedBy=default.target
 ```
 
-## Hermes provider config
-
-Each local engine needs a custom provider in `config.yaml`:
-
-```yaml
-# In ~/AppData/Local/hermes/config.yaml
-providers:
-  llama-qwen:
-    name: llama.cpp Qwen3.6 (WSL)
-    base_url: http://<WSL2-IP>:8080/v1
-    api_key: not-needed
-    model: qwen3.6-heretic
-
-  # vllm:
-  #   name: vLLM (WSL)
-  #   base_url: http://<WSL2-IP>:8000/v1
-  #   api_key: not-needed
-  #   model: my-model
-```
-
-Find WSL2 IP: `wsl ip addr show eth0 | grep "inet "`
-
-## Adding a new engine
-
-1. Create a systemd service unit for the engine (e.g. `~/.config/systemd/user/vllm.service`)
-2. Add an entry to `~/scripts/local_engines.json`
-3. Add a matching custom provider in Hermes `config.yaml`
-4. Restart the watchdog: `systemctl --user restart llama-watchdog.service`
-
-The watchdog will also auto-detect providers by name without a config entry if the name contains `"llama"`, `"vllm"`, `"local"`, or `"wsl"`.
-
 ## Commands
 
 ```bash
-# Manage engines
-wsl systemctl --user start llama-server.service    # start specific engine
-wsl systemctl --user stop llama-server.service     # stop specific engine
-wsl systemctl --user start vllm.service            # start another engine
+# Watchdog status
+systemctl --user status llama-watchdog.service --no-pager | head -5
 
-# Check engine status
-wsl systemctl --user status llama-server.service --no-pager | head -5
+# View logs
+journalctl --user -u llama-watchdog.service -n 20 --no-pager
 
-# Watchdog logs
-wsl journalctl --user -u llama-watchdog.service -n 20 --no-pager
+# Toggle vision mmproj
+~/scripts/toggle_mmproj.sh llama-qwen on      # enable vision
+~/scripts/toggle_mmproj.sh llama-qwen off     # disable vision (save VRAM)
+~/scripts/toggle_mmproj.sh llama-qwen toggle  # flip
+~/scripts/toggle_mmproj.sh llama-qwen status  # check
 
-# Edit engine config
-wsl nano ~/scripts/local_engines.json
-wsl systemctl --user restart llama-watchdog.service
+# Test switch TO a local engine
+echo "Model switched in-place: cloud (opencode) -> local (llama-qwen)" >> /mnt/c/Users/MaJor/AppData/Local/hermes/logs/agent.log
 
-# Test: simulate switch TO a local engine (should start)
-echo "2026-07-02 18:30:00 INFO agent: Model switched in-place: cloud (opencode) -> local (llama-qwen)" >> /mnt/c/Users/MaJor/AppData/Local/hermes/logs/agent.log
-
-# Test: simulate switch FROM a local engine (should stop)
-echo "2026-07-02 18:30:05 INFO agent: Model switched in-place: local (llama-qwen) -> cloud (opencode)" >> /mnt/c/Users/MaJor/AppData/Local/hermes/logs/agent.log
-
-# Test: auto-detect a vllm provider
-echo "2026-07-02 18:30:10 INFO agent: Model switched in-place: cloud (opencode) -> mymodel (vllm)" >> /mnt/c/Users/MaJor/AppData/Local/hermes/logs/agent.log
+# Test switch FROM a local engine
+echo "Model switched in-place: local (llama-qwen) -> cloud (opencode)" >> /mnt/c/Users/MaJor/AppData/Local/hermes/logs/agent.log
 ```
 
 ## Pitfalls
 
-- **state.db does NOT track `/model` switches mid-TUI-session** — it only updates when sessions are created. The `model` column stays at the original provider. Use agent.log tailing for fast TUI detection.
-- **SQLite over /mnt/c/ via 9p** — file locking is broken. Always copy the DB to `/tmp` before querying.
-- **Cold load time** — a 17GB GGUF takes ~36s on WSL2. Set Hermes `gateway_timeout` high enough (>180s).
-- **LD_LIBRARY_PATH is critical in systemd** — systemd user services don't inherit environment. Each engine service unit must set its own environment variables.
-- **exit.target must be masked** — prevents WSL2 session cycling: `systemctl --user mask exit.target --now`. Without this, WSL tears down all user services every ~60s.
-- **Hermes has NO `on_provider_change` plugin hook** — `VALID_HOOKS` lacks provider-switch events. Workaround is tailing agent.log, which works reliably.
-- **The watchdog uses file-position tracking** — if the log is rotated while the watchdog is stopped, `_last_pos` resets to 0, causing a re-read of old entries. This is benign (only triggers extra start attempts).
-- **Auto-detection is case-insensitive** — provider names like "Llama-Pro", "vLLM-70B", "my-local-model" all work.
-- **Engine config takes precedence** — if a provider is both in `local_engines.json` AND matches an auto-detect pattern, the config file wins.
+- **state.db does NOT track `/model` switches mid-TUI-session** — use agent.log tailing
+- **SQLite over /mnt/c/ 9p** — file locking broken; always copy DB to /tmp before querying
+- **Cold load time** — 17GB GGUF ~36s; set Hermes gateway_timeout >180s
+- **LD_LIBRARY_PATH is critical** — must be set in each systemd service unit
+- **exit.target must be masked** — `systemctl --user mask exit.target --now`
+- **Hermes has NO `on_provider_change` plugin hook** — workaround: tail agent.log
+- **Auto-detection is case-insensitive** — "Llama-Pro", "Gemma-4", "vLLM-70B" all work
+- **Engine config takes precedence** over auto-detection
+- **mmproj flag file is ephemeral** — lives in WSL /tmp; cleared on WSL restart. Set it again after reboot.
+- **Toggle script before switch** — set the mmproj flag BEFORE switching providers; the watchdog reads it on the next 5s cycle.
