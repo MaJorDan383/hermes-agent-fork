@@ -100,6 +100,25 @@ wsl sh -c 'echo "/path/mmproj.gguf" > /tmp/llama-gemma-4_mmproj'
 wsl journalctl --user -u llama-watchdog.service -n 20 --no-pager
 ```
 
+## Future / Ideal Implementation
+
+The current after-start restart is a workaround. **The ideal solution is a Hermes core-side pre-model-load hook** that fires BEFORE the engine starts, giving the agent a chance to ask and configure the mmproj flag. This would:
+
+- Eliminate the cold restart (~36s delay when switching to mmproj)
+- Allow seamless vision/no-vision switching without downtime
+- Prevent accidental OOM freezes on consumer GPUs (RTX 4090 = 24 GB — mmproj can push you over)
+
+**No platform handles this well today.** LM Studio, Ollama, llama.cpp — none of them ask or configure multimodal projection at load time. They either always load the mmproj (wasting VRAM) or require manual config changes. Consumer hardware (24 GB and under) lives at the edge of OOM constantly — a single mmproj file can mean the difference between a working session and a hard freeze.
+
+**If the Hermes team implements a `on_provider_switch` plugin hook** (or similar pre-model-loading event), this watchdog can be simplified to:
+
+1. Hook fires before engine start
+2. Agent asks user about mmproj
+3. Flag is set before the engine ever loads
+4. No restart needed — first load is correct
+
+This would put Hermes **lightyears ahead** of every other local inference frontend. No other platform — not LM Studio, not Ollama, not text-generation-webui — intelligently manages vision projection at provider-switch time on consumer GPUs.
+
 ## Pitfalls
 
 - Engine starts **without** mmproj first. Agent asks in chat. If yes → engine restarts WITH mmproj (cold load time applies on restart)
