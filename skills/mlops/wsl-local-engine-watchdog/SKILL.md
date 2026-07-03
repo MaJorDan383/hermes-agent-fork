@@ -1,9 +1,9 @@
 ---
 name: wsl-local-engine-watchdog
-description: "WSL2 local engine watchdog — STRICT EXCLUSIVITY arbiter: only one local LLM engine runs at a time. Dynamic mmproj for ANY model. Agent prompts at switch time."
-version: 7.0.0
+description: "WSL2 local engine watchdog — STRICT EXCLUSIVITY arbiter: only one local LLM engine runs at a time. Dynamic mmproj for ANY model with dual-prompt mode (agent + local fallback)."
+version: 7.1.0
 author: Hermes Agent
-tags: [wsl, llama.cpp, vllm, watchdog, vram, provider-switch, local-engine, systemd, arbiter, exclusivity, mmproj, vision, multimodal]
+tags: [wsl, llama.cpp, vllm, watchdog, vram, provider-switch, local-engine, systemd, arbiter, exclusivity, mmproj, vision, multimodal, offline]
 metadata:
   hermes:
     related_skills: [llama-cpp-wsl-ops]
@@ -13,26 +13,41 @@ metadata:
 
 A Python watchdog for WSL2 that **auto-starts and auto-stops local inference engines** based on which Hermes provider you select. **Enforces strict exclusivity — only one engine service is ever active at a time** to guarantee VRAM safety.
 
-**Dynamic mmproj (vision):** The watchdog writes an `EnvironmentFile` (`~/scripts/mmproj_env.conf`) before starting the engine. If `/tmp/<provider>_mmproj` exists, it includes `--mmproj <path>` in the file; otherwise the file is empty/absent and the engine starts without vision. **This works for ANY provider, ANY model.**
+**Dynamic mmproj (vision):** The watchdog writes an `EnvironmentFile` (`~/scripts/mmproj_env.conf`) before starting the engine. If `/tmp/<provider>_mmproj` exists, it includes `--mmproj <path>`; otherwise the engine starts without vision. **Works for ANY provider, ANY model.**
+
+**Dual-Prompt Mode:** The mmproj question is asked in two ways:
+1. **Agent prompt** — When a capable (cloud) agent is available, it uses `clarify` to ask before the switch
+2. **Watchdog self-prompt** — When running locally (no agent), the watchdog **waits 15 seconds** after detecting the switch, giving you time to type the toggle command
 
 ---
 
-## Agent Prompt Workflow
+## mmproj Prompt Modes
 
-When this skill is loaded and the agent detects the user intends to switch to a local (WSL) provider:
+### Mode 1: Agent Prompt (cloud model available)
+When this skill is loaded and the agent detects you're about to switch to a local provider with mmproj support:
 
-1. **Check if the provider supports mmproj** — look up the provider in `local_engines.json`. If the provider isn't in the config but matches auto-detection patterns ("llama", "gemma", "qwen", "heretic", "local", "wsl"), assume it may have mmproj support.
+1. Agent uses `clarify` to ask: *"Would you like to load the vision mmproj for [provider]? This uses ~1-2GB more VRAM."*
+2. Set the flag **before** switching:
+   - **Yes:** `wsl touch /tmp/<provider>_mmproj`
+   - **Custom path:** `wsl sh -c 'echo "/path/to/mmproj.gguf" > /tmp/<provider>_mmproj'`
+   - **No:** `wsl rm -f /tmp/<provider>_mmproj`
+3. Switch providers normally
 
-2. **Use the `clarify` tool** to ask the user:
-   > "Provider [name] is a local model. Would you like to load the vision mmproj? This uses ~1-2GB more VRAM."
-   > Choices: ["Yes, load vision", "No, save VRAM"]
+### Mode 2: Watchdog Self-Prompt (local-only, no agent)
+When you switch providers and no cloud agent is available to prompt you:
 
-3. **Based on the answer, set the flag file via WSL:**
-   - **Yes:** `wsl touch /tmp/<provider_name>_mmproj`
-     - If the user has a custom mmproj path: `wsl sh -c 'echo "<path>" > /tmp/<provider_name>_mmproj'`
-   - **No:** `wsl rm -f /tmp/<provider_name>_mmproj`
+1. You switch to a local model that has `mmproj` configured
+2. Watchdog detects the switch and **waits 15 seconds** before starting the engine
+3. During those 15 seconds, it prints instructions to `journalctl` and polls for the flag:
+   ```
+   [MMPROJ] Model [provider] has vision mmproj available.
+   [MMPROJ] Run: wsl touch /tmp/[provider]_mmproj  (within 15s)
+   [MMPROJ] Waiting 15s for your decision...
+   ```
+4. **If you type the command** in time → engine starts WITH mmproj
+5. **If timeout** → engine starts WITHOUT mmproj (you can restart later with mmproj if desired)
 
-4. The user then switches providers. The watchdog reads the flag on its next 5s poll cycle.
+**15s window tip:** Keep a terminal open to WSL and type the toggle right after you switch models.
 
 ---
 
@@ -40,6 +55,7 @@ When this skill is loaded and the agent detects the user intends to switch to a 
 
 - **Strict exclusivity** — Only one engine service is ever active
 - **Dynamic mmproj** — `/tmp/<provider>_mmproj` flag + EnvironmentFile for ANY model
+- **Dual prompt** — Agent asks (cloud) OR watchdog waits 15s (local)
 - **Auto-starts/stops** on provider switch (agent.log tail)
 - **Auto-stops on app close** (Hermes.exe tasklist check)
 - **Multi-session safe** — checks state.db, won't unload if gateway needs it
@@ -55,17 +71,17 @@ When this skill is loaded and the agent detects the user intends to switch to a 
                              ▼
   local-engine-watchdog (systemd on WSL)
      ├─ agent.log tail — THE trigger (ANY provider name)
-     ├─ /tmp/<provider>_mmproj flag → writes ~/scripts/mmproj_env.conf
-     │    ├─ EXISTS + path → MMPROJ_ARGS=--mmproj <path>
-     │    └─ absent       → empty file (no vision, -1~2GB VRAM)
+     ├─ wait_for_mmproj_decision() — 15s prompt window if mmproj available
+     │    ├─ flag appears → writes ~/scripts/mmproj_env.conf with --mmproj
+     │    └─ timeout     → clears env file (no vision, -1~2GB VRAM)
      ├─ ARBITER — stop every other running engine first
      ├─ tasklist.exe — app close → stop all
      ├─ state.db — multi-session guard
-     └─ log mtime — idle timeout
+     └─ log mtime — idle timeout (15min)
              │
              ▼
-  Per-engine systemd service via EnvironmentFile
-  └── Same service unit, MMPROJ_ARGS injected dynamically
+  Single systemd service with $MMPROJ_ARGS via EnvironmentFile
+  └── Same ExecStart, arg injected dynamically
 ```
 
 ## Components
@@ -90,8 +106,6 @@ When this skill is loaded and the agent detects the user intends to switch to a 
 | `mmproj` | No | Default mmproj GGUF path for this model |
 | `log` | No | Server log path for idle timeout |
 
-Any provider → any engine. The `mmproj` field provides the default path; users can override by writing a custom path into the flag file.
-
 ### 2. Systemd service with EnvironmentFile
 
 `~/.config/systemd/user/llama-server.service`:
@@ -103,28 +117,22 @@ ExecStart=/path/to/llama-server \
   ...other args...
 ```
 
-The `-` prefix on `EnvironmentFile` means "optional" — if absent, `$MMPROJ_ARGS` is empty (no mmproj).
-
 ### 3. Watchdog script: `~/scripts/local_engine_watchdog.py`
 
-Core mmproj logic:
+The core mmproj decision loop:
 ```python
-def write_mmproj_env(provider_name, cfg):
-    flag = f"/tmp/{provider_name}_mmproj"
-    mmproj_path = None
-    if os.path.exists(flag):
-        try:
-            content = open(flag).read().strip()
-            if content: mmproj_path = content
-        except: pass
-        if not mmproj_path:
-            mmproj_path = cfg.get("mmproj", "")
-    if mmproj_path:
-        with open("~/scripts/mmproj_env.conf", "w") as f:
-            f.write(f'MMPROJ_ARGS=--mmproj {mmproj_path} --no-mmproj-offload\n')
-    else:
-        try: os.remove("~/scripts/mmproj_env.conf")
-        except: pass
+def wait_for_mmproj_decision(provider_name, cfg, timeout=15):
+    """If model has mmproj available but no flag, wait briefly for user."""
+    if not cfg.get("mmproj"):
+        return None
+    if os.path.exists(f"/tmp/{provider_name}_mmproj"):
+        return get_mmproj_path(provider_name, cfg)
+    print(f"[MMPROJ] Waiting {timeout}s for your decision...", flush=True)
+    for i in range(timeout):
+        time.sleep(1)
+        if os.path.exists(f"/tmp/{provider_name}_mmproj"):
+            return get_mmproj_path(provider_name, cfg)
+    return None  # timeout, start without mmproj
 ```
 
 ### 4. mmproj toggle script: `~/scripts/toggle_mmproj.sh`
@@ -132,27 +140,31 @@ def write_mmproj_env(provider_name, cfg):
 ```bash
 ./toggle_mmproj.sh <provider> on                                       # enable with default path
 ./toggle_mmproj.sh <provider> off                                      # disable
-./toggle_mmproj.sh <provider> /home/.../mmproj-MyModel-BF16.gguf       # enable with custom path
-./toggle_mmproj.sh <provider> status                                   # check state
+./toggle_mmproj.sh <provider> /custom/mmproj/MyModel.gguf              # enable with custom path
+./toggle_mmproj.sh <provider> toggle                                   # flip state
+./toggle_mmproj.sh <provider> status                                   # check
 ```
 
-## Agent Commands Reference
+## Quick Reference
 
 ```bash
-# Enable mmproj for a model (ANY provider name)
+# Check watchdog logs
+wsl journalctl --user -u llama-watchdog.service -n 30 --no-pager
+
+# Enable mmproj before switching (agent tells you, or do it yourself)
 wsl touch /tmp/llama-gemma-4_mmproj
 
-# Enable with custom mmproj path
-wsl sh -c 'echo "/home/vibrationall/ai/models/mmproj-MyModel.gguf" > /tmp/llama-my-model_mmproj'
+# Enable with custom path
+wsl sh -c 'echo "/home/vibrationall/ai/models/mmproj-MyModel.gguf" > /tmp/llama-gemma-4_mmproj'
 
-# Disable mmproj
+# Disable
 wsl rm -f /tmp/llama-gemma-4_mmproj
 
-# Check if mmproj flag is set
+# Check flag status
 wsl [ -f /tmp/llama-gemma-4_mmproj ] && echo ON || echo OFF
 
-# View watchdog logs
-wsl journalctl --user -u llama-watchdog.service -n 20 --no-pager
+# Restart engine WITH mmproj after starting without it:
+wsl touch /tmp/llama-gemma-4_mmproj && wsl systemctl --user restart llama-server.service
 ```
 
 ## Pitfalls
@@ -165,5 +177,6 @@ wsl journalctl --user -u llama-watchdog.service -n 20 --no-pager
 - **Hermes has NO `on_provider_change` plugin hook** — workaround: tail agent.log
 - **Auto-detection is case-insensitive** — any provider name with "llama", "gemma", "qwen", "heretic", "local", or "wsl"
 - **mmproj flag file is ephemeral** — lives in WSL /tmp; cleared on WSL restart. Re-set after reboot.
-- **Set the flag BEFORE switching providers** — watchdog reads it on the next 5s cycle
+- **15s window starts when watchdog detects the switch** — type `wsl touch /tmp/...` immediately
 - **$MMPROJ_ARGS must be unquoted in ExecStart** — systemd expands the variable; double-quoting makes it a single arg
+- **To add mmproj after starting without:** touch the flag and restart the engine service
