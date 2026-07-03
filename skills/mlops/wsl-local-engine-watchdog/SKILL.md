@@ -1,72 +1,68 @@
 ---
 name: wsl-local-engine-watchdog
-description: "WSL2 local engine watchdog — STRICT EXCLUSIVITY arbiter: only one local LLM engine runs at a time. TRUE OFFLINE mmproj prompt: writes desktop notification, waits indefinitely, works with zero model dependency."
-version: 8.0.0
+description: "WSL2 local engine watchdog — STRICT EXCLUSIVITY arbiter. mmproj prompt IN Hermes desktop chat via clarfy. Works with ANY model (local or cloud). Infinite wait, no timeout."
+version: 9.0.0
 author: Hermes Agent
-tags: [wsl, llama.cpp, vllm, watchdog, vram, provider-switch, local-engine, systemd, arbiter, exclusivity, mmproj, vision, multimodal, offline]
+tags: [wsl, llama.cpp, vllm, watchdog, vram, provider-switch, local-engine, systemd, arbiter, exclusivity, mmproj, vision, multimodal]
 metadata:
   hermes:
     related_skills: [llama-cpp-wsl-ops]
 ---
 
-# WSL Local Engine Watchdog (Strict Exclusivity + True Offline mmproj Prompt)
+# WSL Local Engine Watchdog (Strict Exclusivity + Agent mmproj Prompt)
 
-A Python watchdog for WSL2 that **auto-starts and auto-stops local inference engines** based on which Hermes provider you select. **Enforces strict exclusivity — only one engine service is ever active at a time** to guarantee VRAM safety.
+A Python watchdog for WSL2 that **auto-starts and auto-stops local inference engines** based on which Hermes provider you select. **Enforces strict exclusivity — only one engine service is ever active at a time.**
 
-**Dynamic mmproj (vision):** The watchdog writes an `EnvironmentFile` before starting the engine. If `/tmp/<provider>_mmproj` exists, it injects `--mmproj <path>`. **Works for ANY provider, ANY model, no hardcoded names.**
+**Dynamic mmproj (vision):** When a local model supports multimodal, the watchdog **waits indefinitely** for a `/tmp/<provider>_mmproj` flag file. The flag is set by the Hermes agent (inside the desktop chat) **or** manually by the user.
 
 ---
 
-## mmproj Prompt: Three Layers (No Failure)
+## How the mmproj Prompt Works
 
-The system tries three approaches in order, so you **always** get asked:
+The prompt appears **IN the Hermes desktop app chat** — not as a Windows popup or desktop file.
 
-### Layer 1: Agent Prompt (if a capable model is active)
-When this skill is loaded and the agent detects a switch to a local provider with mmproj:
-- Agent uses `clarify` to ask: *"Load vision mmproj?"*
-- Sets/clears the flag **before** the switch
-- Fastest path — zero delay
+### Primary Path: Agent Asks via clarfy (works with ANY model)
 
-### Layer 2: Desktop Notification + Infinite Wait (offline, no model needed)
-If no agent was available to prompt (local-only session), the watchdog:
+When the skill is loaded and a switch to a local provider with mmproj is detected:
 
-1. **Writes a file to your Windows desktop:** `mmproj_PENDING_<provider>.txt` with clear instructions
-2. **Waits INDEFINITELY** — no 15s timeout, no model dependency, just waits
-3. The engine **will not start** until you make a choice
-4. You see the file on your desktop, read it, and run one of:
+1. **The agent IMMEDIATELY uses the `clarify` tool** to ask in the chat:
+   > "Load vision mmproj for [provider]? This uses ~1-2GB more VRAM."
+   > Choices: ["Yes", "No, skip (remember)"]
+
+2. **Based on the answer:**
+   - **Yes** → Agent runs: `wsl touch /tmp/<provider>_mmproj`
+   - **No** → Agent runs: `wsl sh -c 'echo SKIP > /tmp/<provider>_mmproj'`
+
+3. The watchdog is waiting **indefinitely** (no timeout) — it sees the flag within 1 second and starts the engine.
+
+**This works with any model** — `clarify` is a built-in Hermes tool, not a model capability. Local models can use it too.
+
+### Fallback: Manual via WSL Terminal
+
+If no agent is active, the watchdog prints instructions to `journalctl`. You can set the flag directly:
 
 ```bash
-# Enable vision mmproj (uses default path from config)
-wsl touch /tmp/<provider>_mmproj
-
-# Enable with a custom mmproj path
-wsl sh -c 'echo "/path/to/mmproj.gguf" > /tmp/<provider>_mmproj'
-
-# Skip mmproj (saves preference — won't ask again for this provider)
-wsl sh -c 'echo SKIP > /tmp/<provider>_mmproj'
+wsl touch /tmp/llama-gemma-4_mmproj                              # enable mmproj
+wsl sh -c 'echo "/custom/path/mmproj.gguf" > /tmp/llama-gemma-4_mmproj  # custom path
+wsl sh -c 'echo SKIP > /tmp/llama-gemma-4_mmproj                 # skip + save preference
 ```
 
-5. The engine starts with your choice, the desktop file is removed
-6. Next time: skip preference is remembered, no re-prompt
+### Skip Memory
+Once you skip a provider, `~/scripts/mmproj-skip/<provider>` is created. Next time:
+- Agent skips the question silently
+- Watchdog starts without mmproj immediately
 
-### Layer 3: Saved Skip Preference (no re-asking)
-If you skip mmproj for a provider, a marker file is saved at `~/scripts/mmproj-skip/<provider>`. Next time you switch to that provider, the watchdog respects it silently.
-
-**To reset a skip preference:**
-```bash
-wsl rm /home/vibrationall/scripts/mmproj-skip/llama-gemma-4
-```
+Reset with: `wsl rm ~/scripts/mmproj-skip/llama-gemma-4`
 
 ---
 
 ## Behavior
 
-- **Strict exclusivity** — Only one engine service is ever active
-- **Dynamic mmproj** via EnvironmentFile for ANY model
-- **Three-layer prompt** — never miss the question
-- **Infinite wait** — engine won't start until you decide
-- **Skip memory** — won't re-ask for providers you've already declined
-- **Auto-stops on app close** (Hermes.exe tasklist check)
+- **Prompt via clarfy** — appears IN Hermes desktop chat, works with ANY model
+- **Infinite wait** — watchdog waits forever for the flag (no 15s timeout)
+- **Skip memory** — never re-asks for providers you've declined
+- **Strict exclusivity** — only one engine active at a time
+- **Dynamic mmproj** via `EnvironmentFile` + `$MMPROJ_ARGS`
 - **Multi-session safe** — checks state.db before unloading
 - **Idle timeout (15 min)** — safety-net fallback
 - **Does NOT manage TTS/STT**
@@ -74,28 +70,27 @@ wsl rm /home/vibrationall/scripts/mmproj-skip/llama-gemma-4
 ## Architecture
 
 ```
-  Hermes agent.log ──► "Model switched in-place: ... -> ... (provider)"
-                             │
-                        every 5s tail
-                             ▼
-  LOCAL-ENGINE-WATCHDOG (systemd on WSL)
-     │
-     ├─ wait_for_mmproj_decision(provider, cfg)
-     │    ├─ Saved skip exists? → skip silently
-     │    ├─ Flag exists? → use it
-     │    ├─ Agent set flag? → use it
-     │    └─ NONE OF THE ABOVE →
-     │         ├─ Write mmproj_PENDING_<provider>.txt → Windows DESKTOP
-     │         ├─ Print to journalctl
-     │         └─ WAIT FOREVER, polling /tmp/<provider>_mmproj
-     │              ├─ touch ..._mmproj → start engine WITH vision
-     │              ├─ echo SKIP > ..._mmproj → start without, save skip
-     │              └─ (no action) → engine stays stopped, file visible
-     │
-     ├─ write_mmproj_env(path) → ~/scripts/mmproj_env.conf
-     ├─ ARBITER: stop other engines → start target service
-     ├─ tasklist.exe → app close
-     └─ state.db → multi-session guard
+            Provider switch in Hermes desktop TUI
+                     │
+          ┌──────────┴──────────┐
+          ▼                     ▼
+   Hermes agent.log      Agent (in desktop chat)
+   (watchdog sees it)    loads this skill
+          │                     │
+          ▼                     ▼
+   Watchdog waits ─── Agent uses clarfy to ask user
+   for flag          │          │
+   (no timeout)      ▼          ▼
+                    "Yes"     "No"
+                     │          │
+                     ▼          ▼
+              wsl touch     echo SKIP >
+              ..._mmproj    ..._mmproj
+                     │          │
+                     └────┬─────┘
+                          ▼
+                  Watchdog sees flag
+                  → writes $MMPROJ_ARGS → starts engine
 ```
 
 ## Components
@@ -113,13 +108,6 @@ wsl rm /home/vibrationall/scripts/mmproj-skip/llama-gemma-4
 }
 ```
 
-| Field | Required | Description |
-|---|---|---|
-| `engine` | Yes | Human-readable name |
-| `service` | Yes | systemd service name (with `.service`) |
-| `mmproj` | No | Default mmproj GGUF path |
-| `log` | No | Server log path for idle timeout |
-
 ### 2. Systemd service with dynamic mmproj
 
 ```ini
@@ -128,56 +116,42 @@ EnvironmentFile=-/home/vibrationall/scripts/mmproj_env.conf
 ExecStart=/path/to/llama-server $MMPROJ_ARGS ...
 ```
 
-The `-` prefix means "optional" — if absent, `$MMPROJ_ARGS` is empty.
-
-### 3. Key logic in watchdog
+### 3. Watchdog key logic (infinite wait)
 
 ```python
 def wait_for_mmproj_decision(provider, cfg):
-    """Wait INDEFINITELY. No timeout, no model needed."""
     if has_user_skipped(provider):
-        return None  # saved preference
-    if flag already exists:
-        return extract_path(flag) or cfg["mmproj"]
+        return None                     # skip memory
+    path = get_mmproj_path(provider, cfg)
+    if path:
+        return path                     # already decided
     if not cfg.get("mmproj"):
-        return None  # no mmproj available
-
-    # Show the prompt
-    write_desktop_notification(provider, cfg)
-    while True:  # NO TIMEOUT
+        return None                     # no mmproj available
+    print(f"waiting for /tmp/{provider}_mmproj ...")
+    while True:                         # NO TIMEOUT
         time.sleep(1)
         if flag exists:
-            content = read_flag()
-            if content == "SKIP":
-                save_skip(provider)
-                remove_notification()
-                return None
-            return content or cfg["mmproj"]
+            # extract path or SKIP decision...
 ```
 
-## User Reference
+## Quick Reference
 
 ```bash
-# Enable mmproj for any provider (uses default path from config)
-wsl touch /tmp/llama-gemma-4_mmproj
+# Agent asks in chat; or set manually:
+wsl touch /tmp/llama-gemma-4_mmproj                          # enable
+wsl sh -c 'echo "/path/mmproj.gguf" > /tmp/llama-gemma-4_mmproj  # custom
+wsl sh -c 'echo SKIP > /tmp/llama-gemma-4_mmproj             # skip + save
 
-# Custom mmproj path
-wsl sh -c 'echo "/home/ai/models/mmproj-MyModel.gguf" > /tmp/llama-gemma-4_mmproj'
+# Reset skip memory
+wsl rm ~/scripts/mmproj-skip/llama-gemma-4
 
-# Skip (saves preference)
-wsl sh -c 'echo SKIP > /tmp/llama-gemma-4_mmproj'
+# Watchdog logs
+wsl journalctl --user -u llama-watchdog.service -n 20 --no-pager
 
-# Reset a saved skip preference
-wsl rm /home/vibrationall/scripts/mmproj-skip/llama-gemma-4
-
-# See what's pending
-wsl ls /mnt/c/Users/MaJor/Desktop/mmproj_PENDING_*.txt
-
-# Add mmproj after starting without (requires restart)
-wsl touch /tmp/llama-gemma-4_mmproj && wsl systemctl --user restart llama-server.service
-
-# Check watchdog logs
-wsl journalctl --user -u llama-watchdog.service -n 30 --no-pager
+# Toggle script
+wsl ~/scripts/toggle_mmproj.sh llama-gemma-4 status
+wsl ~/scripts/toggle_mmproj.sh llama-gemma-4 on
+wsl ~/scripts/toggle_mmproj.sh llama-gemma-4 off
 ```
 
 ## Pitfalls
@@ -188,8 +162,6 @@ wsl journalctl --user -u llama-watchdog.service -n 30 --no-pager
 - **LD_LIBRARY_PATH** — must be explicit in each service unit
 - **exit.target must be masked** — `systemctl --user mask exit.target --now`
 - **No `on_provider_change` hook** — workaround: tail agent.log
-- **Auto-detection is case-insensitive** — any provider with "llama", "gemma", "qwen", "heretic", "local", or "wsl"
-- **Flag file is ephemeral** — lives in /tmp; cleared on WSL restart
-- **Skip preference is persistent** — lives in ~/scripts/mmproj-skip/
-- **$MMPROJ_ARGS must be unquoted** in ExecStart
-- **Engine won't start until you decide** — the prompt blocks the start
+- **clarfy works with ANY model** — it's a tool, not a model capability
+- **Flag is ephemeral** — lives in /tmp; clears on WSL restart
+- **Agent MUST ask before the watchdog starts** — the skill instruction enforces this
